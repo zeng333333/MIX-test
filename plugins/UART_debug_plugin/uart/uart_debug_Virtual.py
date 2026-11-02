@@ -46,6 +46,8 @@ import time
 import argparse
 import re
 import sys
+import termios
+import tty
 
 
 # ============================================================================
@@ -58,6 +60,15 @@ class VirtualECB:
     # 4 个治具传感器: 位置(in/out) 与 高度(up/down)
     SENSORS = ("in", "out", "up", "down")
     BEAMS = ("frontsensor", "rearsensor")
+
+    # 所有可识别的完整指令(用于判断“输入是否还没输完”)
+    KNOWN_COMMANDS = (
+        "press", "release", "in", "out", "up", "down",
+        "in?", "out?", "down?", "up?", "frontsensor?", "rearsensor?",
+        "reset", "version", "help",
+    )
+    _LED_PARTIAL_RE = re.compile(r"^led(\d{0,3})?(\s*,\s*[rgby]?)?$")
+    _LED_FULL_RE = re.compile(r"^led\d{1,3}\s*,\s*[rgby]$")
 
     def __init__(self):
         # 物理到位开关: True = sensor 触发(查询返回 ON)
@@ -199,6 +210,39 @@ class VirtualECB:
         return "ERR:UNKNOWN"
     # ------------------------------------------------------------------------
 
+    # ---------------- 断句辅助 ----------------
+    @classmethod
+    def is_partial_command(cls, text):
+        """判断一段串口输入是否仍是某条指令的前半部分。
+
+        串口工具经常逐字符发送且不带回车，需要靠“串口静默超时”断句；
+        若已收到的内容还是某条已知指令的前缀，应继续等待后续字符，
+        避免把 "hel" 当成一条完整指令而提前返回 ERR:UNKNOWN。
+
+        Args:
+            text (str): 已接收但尚未断句的输入文本。
+
+        Returns:
+            bool: True 表示仍可能是某条完整指令的前缀，需要继续等待；
+                False 表示已可当作一条完整指令处理。
+
+        Example:
+            >>> VirtualECB.is_partial_command("hel")
+            True
+            >>> VirtualECB.is_partial_command("help")
+            False
+        """
+        t = text.strip().lower()
+        if not t:
+            return True
+        if any(cmd.startswith(t) and cmd != t for cmd in cls.KNOWN_COMMANDS):
+            return True
+        if "led".startswith(t):
+            return True
+        if cls._LED_PARTIAL_RE.match(t) and not cls._LED_FULL_RE.match(t):
+            return True
+        return False
+
     # ---------------- 状态打印 ----------------
     def state_lines(self):
         with self._lock:
@@ -215,37 +259,78 @@ class VirtualECB:
 # ============================================================================
 
 def serial_service(master_fd, slave_name, ecb):
-    """
-    后台线程: 从虚拟串口读取指令 -> 交给 VirtualECB 处理 -> 写回响应。
-    真实调试工具(宿主)连接到 slave_name 即可像操作真实电控板一样交互。
+    """后台线程: 从虚拟串口读取指令 -> 交给 VirtualECB 处理 -> 写回响应。
+
+    宿主写入的字节可能被拆成多次到达(甚至一次只到一个字符)，因此这里
+    先累积到缓冲区，再按两种方式断句：
+
+    1. 收到换行/回车(\\n、\\r)：按行逐条处理；
+    2. 串口静默超过 IDLE_FLUSH：把缓冲区内容当作一条完整指令处理，
+       以兼容不带回车的手动输入；若内容仍是某条指令的前缀，则再宽限
+       到 PREFIX_GRACE 秒。
+
+    Args:
+        master_fd (int): pty 主端文件描述符，用于读写虚拟串口。
+        slave_name (str): 虚拟串口从端路径，仅用于日志打印。
+        ecb (VirtualECB): 虚拟电控板状态机实例。
     """
     print(f"✅ 虚拟电控板已启动, 串口路径: {slave_name}", flush=True)
     print("提示: 让 ATLAS fixture 插件 / 自写工具连接以上串口路径即可调试。\n", flush=True)
 
+    IDLE_FLUSH = 0.30      # 静默超过该时长(秒)视为一条指令结束
+    PREFIX_GRACE = 0.80    # 若内容仍是某条指令的前缀, 再宽限到该时长(秒)
+
+    buf = ""
+    last_rx = time.monotonic()
+
+    def reply(line):
+        """处理一条指令并把响应文本写回虚拟串口。"""
+        resp = ecb.handle(line)
+        if not resp:
+            return
+        try:
+            os.write(master_fd, (resp + "\r\n").encode("utf-8"))
+            print(f"📤 回: {resp}", flush=True)
+        except OSError:
+            pass
+
     try:
         while True:
-            r, _, _ = select.select([master_fd], [], [], 0.1)
-            if master_fd not in r:
-                continue
-            try:
-                data = os.read(master_fd, 1024)
-            except OSError:
-                break
-            if not data:
-                continue
-            text = data.decode("utf-8", errors="replace")
-            print(f"📥 收: {text.rstrip()}", flush=True)
+            r, _, _ = select.select([master_fd], [], [], 0.05)
+            if master_fd in r:
+                try:
+                    data = os.read(master_fd, 1024)
+                except OSError:
+                    break
+                if not data:
+                    continue
+                text = data.decode("utf-8", errors="replace")
+                print(f"📥 收: {text!r}", flush=True)
+                # 统一换行符, 便于按行切分(也处理 \r\n 被拆成两次读取的情况)
+                buf += text.replace("\r\n", "\n").replace("\r", "\n")
+                last_rx = time.monotonic()
 
-            # 可能一行内有多条指令(以换行/回车分隔), 逐条处理
-            for line in text.splitlines():
-                resp = ecb.handle(line)
-                if resp:
-                    out = resp + "\r\n"
-                    try:
-                        os.write(master_fd, out.encode("utf-8"))
-                        print(f"📤 回: {resp}", flush=True)
-                    except OSError:
-                        break
+                if "\n" in buf:
+                    *lines, buf = buf.split("\n")
+                    for line in lines:
+                        line = line.strip()
+                        if line:
+                            reply(line)
+                continue
+
+            # 串口静默: 把残留缓冲当作一条完整指令
+            if not buf:
+                continue
+            idle = time.monotonic() - last_rx
+            if idle < IDLE_FLUSH:
+                continue
+            cmd = buf.strip()
+            if cmd and ecb.is_partial_command(cmd) and idle < PREFIX_GRACE:
+                continue
+            buf = ""
+            if cmd:
+                print(f"📨 静默断句: {cmd}", flush=True)
+                reply(cmd)
     except Exception as e:
         print(f"❌ 串口服务出错: {e}", flush=True)
     finally:
@@ -332,6 +417,14 @@ def main():
     else:
         master_fd, slave_fd = pty.openpty()
         slave_name = os.ttyname(slave_fd)
+
+        # 关闭从端的回显/行缓冲: 否则宿主写入的每个字符会被回显回主端,
+        # 虚拟电控板会把回显内容再当成一条指令重复解析。
+        try:
+            tty.setraw(slave_fd)
+        except (OSError, termios.error):
+            pass
+
         print("=== 虚拟串口创建成功 ===")
         print(f"测试用串口路径: {slave_name}")
         print("-" * 50)
