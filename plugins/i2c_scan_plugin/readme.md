@@ -18,7 +18,7 @@
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │ [目标与扫描驱动]  项目▾  IP[____]  端口:7801/7802  SSH:mixadmin/已配置  [连接测试] │
 ├───────────────────────────────────────────────────────────────────────────────┤
-│ [按槽位扫描]  [扫描全部槽位] [停止]   当前扫描命令: sudo -S /mix/addon/detect_i2c -y 0 │
+│ [按槽位扫描]  [扫描全部槽位] [停止]   当前扫描命令: sudo -S /tmp/detect_i2c -y 0 │
 │  ┌────────────────────┬──────────────┬──────┬──────────────────────┐          │
 │  │ 扫描对象            │ 切 mux        │ 扫描 │ 探测到地址            │          │
 │  ├────────────────────┼──────────────┼──────┼──────────────────────┤          │
@@ -56,7 +56,7 @@
 | `hook_base.py` | 加载项目文件；跑「一个槽位」的完整流程；表驱动工厂 | `load_project_module()`、`run_slot_workflow()`、`make_table_hook()` |
 | `transports.py` | 按 `driver` 真正下发动作；把扫描输出解析成地址列表 | `default_registry()`、`parse_found_addresses()` |
 | `projects/*.py` | **每个项目一张数据表**（要扫的槽位 + 怎么切 mux） | `PROJECT`、`SLOTS`、`make_table_hook(...)` |
-| `detect_i2c` | 板端扫描器的本地副本（ARM 版 i2cdetect），备查/下发用 | — |
+| `detect_i2c` | 板端扫描器的本地副本（ARM 版 i2cdetect）；板端缺失时自动下发 | `ensure_detect_i2c()` |
 
 调用关系：`I2cScanPlugin` → `hook_base`（问“这一行该干什么”）→ `transports`（真正去 RPC/SSH 干活）。
 
@@ -162,11 +162,11 @@ def _mux(service, channel):
 SLOTS = [
     # 直接扫：scan 直接给完整的 probe dict
     {'key': 'dut0-WIB', 'label': 'dut0 WIB板 i2c_6', 'port': 7801,
-     'scan': {'kind': 'ssh-scan', 'cmd': 'sudo -S /mix/addon/detect_i2c -y 6'}},
+     'scan': {'kind': 'ssh-scan', 'cmd': 'sudo -S /tmp/detect_i2c -y 6'}},
 
     # 先切 array mux 的通道 1，再扫
     {'key': 'dut0-array-ch1', 'label': 'dut0 Array i2c_0 通道1', 'port': 7801,
-     'scan': {'kind': 'ssh-scan', 'cmd': 'sudo -S /mix/addon/detect_i2c -y 0'},
+     'scan': {'kind': 'ssh-scan', 'cmd': 'sudo -S /tmp/detect_i2c -y 0'},
      'mux': [_mux('i2c_mux_array', 1)]},
 ]
 
@@ -202,7 +202,7 @@ def needs_mux(key): return _hook.needs_mux(key)
 ### 5.3 b610 这两个文件多做的事
 
 它们把表里的 `'i2c_8'` 写法翻译成板端命令（`_hook_rows()` + `SSH_TPL`），
-所以表里只需要写总线号，不用手抄 `sudo -S /mix/addon/detect_i2c -y 8`：
+所以表里只需要写总线号，不用手抄 `sudo -S /tmp/detect_i2c -y 8`：
 
 ```python
 SSH_TPL = '%s%s -y {bus}' % (SUDO, DETECT_I2C)   # SUDO 默认 'sudo -S '
@@ -238,7 +238,8 @@ Error: Could not open file `/dev/i2c-4': Permission denied ... Run as root?
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `I2C_SUDO` | `sudo -S ` | sudo 前缀；**置空则不加 sudo**（设备已放开 `/dev/i2c-*` 权限时用） |
-| `I2C_DETECT_BIN` | `/mix/addon/detect_i2c` | 板端扫描器路径；换 `i2cdetect` 需其输出能被解析 |
+| `I2C_DETECT_BIN` | `/tmp/detect_i2c` | 板端扫描器路径；换 `i2cdetect` 需其输出能被解析 |
+| `I2C_DETECT_LOCAL_BIN` | 插件目录下的 `detect_i2c` | 自动下发时使用的**本地副本**路径（换一份编译产物时用） |
 | `I2C_SSH_PASSWORD` | 见项目文件 | 覆盖项目里的 SSH 密码 |
 
 SSH 账号/密码写在项目文件的 `default_ssh_user` / `default_ssh_password`
@@ -252,6 +253,23 @@ SSH 账号/密码写在项目文件的 `default_ssh_user` / `default_ssh_passwor
 ```bash
 I2C_SUDO= python3 main_application.py
 ```
+
+### 6.5 扫描器缺失时自动下发
+
+每条 `ssh-scan` 动作执行前会先自检板端扫描器路径是否可执行
+（`transports.ensure_detect_i2c()`）：
+
+- **已存在** → 直接扫，不做任何上传；
+- **缺失** → 从插件目录的 `detect_i2c` 副本下发（可用 `I2C_DETECT_LOCAL_BIN` 换本地文件）：
+  1. `scp` 传到 `<路径>.mixup`（复用 SSHManager 的 ControlMaster 连接，不必再认证一次）；
+  2. 板上没有 scp/sftp 时退回 base64 分块写入（只依赖板端 `base64`）；
+  3. `chmod +x` + `mv -f` 落位，再 `test -x` 复核。
+- 命令里用的是**别的扫描器**（如 `/usr/bin/i2cdetect`）→ 不补，按原命令执行。
+
+自检结果按 `(ip, 扫描器路径)` 缓存在 `ctx['_i2c_tool_ready']`，一轮扫描只查/传一次；
+下发失败会直接抛错并显示在槽位日志里（`自动下发 /tmp/detect_i2c 失败: ...`），不会静默跳过。
+板端路径需可写（默认 `/tmp` 可以）；若改成 `/usr/local/bin` 这类目录，需要额外 sudo，
+建议保持默认。
 
 ---
 
@@ -274,6 +292,7 @@ I2C_SUDO= python3 main_application.py
 | `RPC 无法连接 ip:port → ...` | 同上（由建立连接时的 TCP ping 抛出） |
 | `创建 SSH 管理器失败(...)` | SSH 账号/密码没配（改项目文件的 `default_ssh_*`） |
 | `ssh 执行失败(rc=..., 耗时) cmd=... :: stderr` | 会把 rc、耗时、stderr 原文带出来：常见是密码不对（`sudo: a password is required`）、扫描器路径不存在（用 `I2C_DETECT_BIN` 改） |
+| `自动下发 /tmp/detect_i2c 失败: ...` | 板端缺扫描器且自动补齐失败：多为板端不可写、无 scp/base64，或本地副本不存在（用 `I2C_DETECT_LOCAL_BIN` 指定） |
 | `✓ dut0-WIB: (空) (0.12s)` | 扫**成功了**但这条总线上确实没器件；与“没扫成功”（会带错误信息）区分开 |
 | `首次错误完整堆栈` | 批量扫描里第一处失败的完整 traceback，用于定位 |
 
@@ -303,7 +322,7 @@ I2C_SUDO= python3 main_application.py
 ### 8.2 probe 格式
 
 ```python
-{'kind': 'ssh-scan', 'cmd': 'sudo -S /mix/addon/detect_i2c -y 8'}  # 板端扫，结果自动解析
+{'kind': 'ssh-scan', 'cmd': 'sudo -S /tmp/detect_i2c -y 8'}  # 板端扫，结果自动解析
 {'kind': 'rpc', 'service': 'xxx', 'method': 'yyy', 'args': []}     # 走 RPC 取一组地址
 {'kind': 'none'}                                                    # 只切不扫（手动接线场景）
 ```

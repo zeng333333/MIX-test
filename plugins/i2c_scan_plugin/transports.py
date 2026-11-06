@@ -15,6 +15,7 @@
 
 import os
 import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -185,6 +186,235 @@ def _import_and_add_mix_path():
         sys.path.insert(0, candidate)
 
 
+# --------------------------------------------------------------------------
+# 板端扫描器自动补齐（detect_i2c）
+#
+# 规则：ssh 命令里出现 detect_i2c 时，先查板端该路径是否可执行；缺了就从插件
+# 目录下的同名副本下发过去，避免换一台设备就得手工拷工具。
+# 下发优先用 scp（复用 SSHManager 的 ControlMaster 会话，不必再认证一次）；
+# 板上没有 scp/sftp 时退回 base64 分块写入（依赖板端 base64）。
+# 命令里用的是别的扫描器（如 /usr/bin/i2cdetect）时不做补齐——不能把 ARM 版
+# detect_i2c 冒充成别家的工具。
+# --------------------------------------------------------------------------
+
+TOOL_NAME = 'detect_i2c'
+LOCAL_TOOL_ENV = 'I2C_DETECT_LOCAL_BIN'   # 本地副本路径覆盖（默认与插件同目录）
+
+
+def _shq(text):
+    """把字符串转成远端 shell 安全的单引号字面量。
+
+    Args:
+        text (str): 原始字符串。
+
+    Returns:
+        str: 单引号包裹后的串；内部的单引号替换成 '"'"' 拼接。
+    """
+    return "'" + str(text).replace("'", "'\"'\"'") + "'"
+
+
+def _local_tool_path():
+    """返回本地 detect_i2c 副本路径。
+
+    Returns:
+        str: 优先取环境变量 ``I2C_DETECT_LOCAL_BIN``，否则用插件目录下的
+            ``detect_i2c``（与 transports.py 同级）。
+    """
+    env = os.environ.get(LOCAL_TOOL_ENV)
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), TOOL_NAME)
+
+
+def _tool_path_in_cmd(cmd):
+    """从待执行的 ssh 命令里取出 detect_i2c 的远端路径。
+
+    只按“空白切分后的某个参数 basename 等于 detect_i2c”判定，这样
+    ``sudo -S /tmp/detect_i2c -y 8``、``sudo -S -p MIXSUDO: /tmp/detect_i2c -y 8``
+    都能取到；命令里若没有该工具则返回 None。
+
+    Args:
+        cmd (str): 下发给板端的完整 shell 命令。
+
+    Returns:
+        str | None: 远端工具路径；未使用 detect_i2c 时为 None。
+    """
+    for tok in str(cmd or '').split():
+        t = tok.strip('\'"')
+        if os.path.basename(t) == TOOL_NAME:
+            return t
+    return None
+
+
+def _remote_exec(mgr, ip, cmd, timeout=10):
+    """执行一条板端命令并把返回值统一成 ``(rc, stdout, stderr)``。
+
+    Args:
+        mgr: SSHManager（expect 包装 ssh）实例。
+        ip (str): 目标板卡 IP。
+        cmd (str): 远端命令。
+        timeout (int, optional): 超时秒数。
+
+    Returns:
+        tuple: ``(rc, stdout, stderr)``；执行器抛异常时返回 rc=1 与异常文本。
+    """
+    try:
+        res = mgr.execute_command(ip, cmd, timeout=timeout)
+    except Exception as e:
+        return 1, '', '%s: %s' % (type(e).__name__, e)
+    if isinstance(res, tuple) and len(res) >= 3:
+        return res[0], res[1] or '', res[2] or ''
+    if isinstance(res, tuple) and len(res) == 2:   # 兼容旧/替身实现 (ok, out)
+        ok, out = res
+        return (0 if ok else 1), out or '', ''
+    return 1, '', 'execute_command 返回格式无法识别: %r' % (res,)
+
+
+def _scp_upload(mgr, ip, local, remote, timeout=20):
+    """用 scp 把本地文件传到板端（复用 SSHManager 的 ControlMaster 连接）。
+
+    说明：SSHManager 每次 execute_command 都会建立 ``ControlMaster=auto`` 且
+    ``ControlPersist=30`` 的主连接（socket 路径见 ssh_manager 的
+    ``/tmp/mix_ssh_exec_<user>_<ip>_<port>.sock``）。刚做过自检命令时该 socket
+    仍然有效，scp 只需 ``ControlPath=`` 复用，不必重新输密码。
+
+    Args:
+        mgr: SSHManager 实例（提供 username / port）。
+        ip (str): 目标板卡 IP。
+        local (str): 本地文件路径。
+        remote (str): 板端目标路径。
+        timeout (int, optional): scp 超时秒数。
+
+    Returns:
+        tuple[bool, str]: ``(是否成功, 失败原因)``。
+    """
+    port = int(getattr(mgr, 'port', 22) or 22)
+    user = getattr(mgr, 'username', '') or ''
+    mux = '/tmp/mix_ssh_exec_%s_%s_%d.sock' % (user, ip, port)
+    cmd = [
+        'scp', '-q',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'BatchMode=yes',
+        '-o', 'ControlMaster=no',
+        '-o', 'ControlPath=' + mux,
+        '-P', str(port),
+        local, '%s@%s:%s' % (user, ip, remote),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return False, '%s: %s' % (type(e).__name__, e)
+    if proc.returncode == 0:
+        return True, ''
+    detail = (proc.stderr or proc.stdout or '').strip().replace('\n', ' | ')
+    return False, detail or ('scp rc=%s' % proc.returncode)
+
+
+def _b64_upload(mgr, ip, local, remote, timeout=10, chunk=1200):
+    """退回方案：把文件 base64 分块写入板端（只依赖板端 ``base64`` 命令）。
+
+    Args:
+        mgr: SSHManager 实例。
+        ip (str): 目标板卡 IP。
+        local (str): 本地文件路径。
+        remote (str): 板端目标路径（先写 ``<remote>.b64``，解码后再落位）。
+        timeout (int, optional): 单条命令超时秒数。
+        chunk (int, optional): 每个分块的 base64 字符数，避免单条命令过长
+            被 PTY/expect 截断。
+
+    Returns:
+        tuple[bool, str]: ``(是否成功, 失败原因)``。
+    """
+    import base64
+
+    with open(local, 'rb') as f:
+        blob = base64.b64encode(f.read()).decode('ascii')
+
+    b64_path = remote + '.b64'
+    rc, out, err = _remote_exec(mgr, ip, 'rm -f %s' % _shq(b64_path), timeout)
+    if rc not in (0, '0', None):
+        return False, '清理临时文件失败(rc=%s): %s' % (rc, (err or out).strip()[:200])
+
+    for i in range(0, len(blob), chunk):
+        piece = blob[i:i + chunk]
+        rc, out, err = _remote_exec(
+            mgr, ip, "printf '%%s' %s >> %s" % (_shq(piece), _shq(b64_path)), timeout)
+        if rc not in (0, '0', None):
+            return False, '分块写入失败(rc=%s): %s' % (rc, (err or out).strip()[:200])
+
+    rc, out, err = _remote_exec(
+        mgr, ip, 'base64 -d < %s > %s && chmod +x %s && rm -f %s'
+        % (_shq(b64_path), _shq(remote), _shq(remote), _shq(b64_path)), timeout)
+    if rc not in (0, '0', None):
+        return False, 'base64 解码落位失败(rc=%s): %s' % (rc, (err or out).strip()[:200])
+    return True, ''
+
+
+def ensure_detect_i2c(ctx, mgr, ip, cmd, log=None):
+    """确保板端有可执行的 detect_i2c；缺失时从插件目录自动下发。
+
+    检查结果按 ``(ip, 远端路径)`` 缓存在 ``ctx['_i2c_tool_ready']``，一轮扫描里
+    只查/传一次。只在命令确实引用 detect_i2c 时才动手，自定义扫描器不受影响。
+
+    Args:
+        ctx (dict): 扫描上下文（由插件工作线程构造）。
+        mgr: SSHManager 实例，用于执行板端命令。
+        ip (str): 目标板卡 IP。
+        cmd (str): 即将下发的 ssh 命令。
+        log (callable, optional): 调试日志回调，形如 ``log(str)``。
+
+    Raises:
+        RuntimeError: 自检失败、本地副本缺失，或下发/安装失败。
+    """
+    remote = _tool_path_in_cmd(cmd)
+    if not remote:
+        return
+    key = (ip, remote)
+    ready = ctx.setdefault('_i2c_tool_ready', set())
+    if key in ready:
+        return
+
+    def _log(msg):
+        if log:
+            log(msg)
+
+    check = 'if test -x %s; then echo MIX_TOOL_OK; else echo MIX_TOOL_MISSING; fi' % _shq(remote)
+    rc, out, err = _remote_exec(mgr, ip, check, 10)
+    if rc not in (0, '0', None):
+        raise RuntimeError('检查板端 %s 失败(rc=%s): %s'
+                           % (remote, rc, (err or out).strip()[:200]))
+    if 'MIX_TOOL_OK' in (out or ''):
+        ready.add(key)
+        _log('板端已存在 %s，无需下发' % remote)
+        return
+
+    local = _local_tool_path()
+    if not os.path.isfile(local):
+        raise RuntimeError('板端缺少 %s，且本地副本不存在: %s（可用环境变量 %s 指定本地路径）'
+                           % (remote, local, LOCAL_TOOL_ENV))
+    size = os.path.getsize(local)
+    _log('板端缺少 %s，开始自动下发（本地 %s，%d bytes）' % (remote, local, size))
+
+    # 先传临时文件，再 chmod + mv，避免把没传完的文件当成“已存在”。
+    staging = remote + '.mixup'
+    ok, detail = _scp_upload(mgr, ip, local, staging)
+    if not ok:
+        _log('scp 下发不可用(%s)，改用 base64 分块下发' % (detail or '未知原因'))
+        ok, detail = _b64_upload(mgr, ip, local, staging, timeout=10)
+    if not ok:
+        raise RuntimeError('自动下发 %s 失败: %s' % (remote, detail))
+
+    rc, out, err = _remote_exec(
+        mgr, ip, 'chmod +x %s && mv -f %s %s && test -x %s && echo MIX_TOOL_OK'
+        % (_shq(staging), _shq(staging), _shq(remote), _shq(remote)), 10)
+    if rc not in (0, '0', None) or 'MIX_TOOL_OK' not in (out or ''):
+        raise RuntimeError('安装 %s 失败(rc=%s): %s'
+                           % (remote, rc, (err or out).strip()[:200]))
+    ready.add(key)
+    _log('已下发 %s（%d bytes）并赋可执行权限' % (remote, size))
+
+
 def make_ssh_runner(default_timeout=30):
     """构造 SSH 动作执行器。
 
@@ -259,6 +489,8 @@ def make_ssh_runner(default_timeout=30):
             # 改为让 sudo 用 -p 指定一个不会出现的提示串。
             if 'sudo -S' in cmd and '-p' not in cmd:
                 cmd = cmd.replace('sudo -S', 'sudo -S -p MIXSUDO:', 1)
+        # 板端缺 detect_i2c 时自动下发（只对引用该工具的命令生效，按 ip+路径缓存）
+        ensure_detect_i2c(ctx, mgr, ip, cmd, _d)
         _d('ip=%s user=%s port=%s timeout=%ss' % (
             ip, ctx.get('ssh_username'), ctx.get('ssh_port') or 22, timeout))
         _d('cmd=%s' % cmd)

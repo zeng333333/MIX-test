@@ -88,9 +88,9 @@ PORT_DUT1 = 7802
 #     “sudo: no tty present and no askpass program specified”。
 #   所以用 `sudo -n`（non-interactive）：设备上需给该用户 NOPASSWD，
 #   即 /etc/sudoers.d/ 里加一行（在设备上执行一次即可）：
-#       mixadmin ALL=(ALL) NOPASSWD: /mix/addon/detect_i2c
+#       mixadmin ALL=(ALL) NOPASSWD: /tmp/detect_i2c
 #   若设备不方便配 sudoers，也可以改用 i2c 组权限后把 'sudo -n ' 去掉。
-DETECT_I2C = os.environ.get('I2C_DETECT_BIN', '/mix/addon/detect_i2c')
+DETECT_I2C = os.environ.get('I2C_DETECT_BIN', '/tmp/detect_i2c')
 SUDO = os.environ.get('I2C_SUDO', 'sudo -S ')   # -S 从 stdin 读密码(无 tty)；置空则不经 sudo
 SSH_TPL = '%s%s -y {bus}' % (SUDO, DETECT_I2C)
 

@@ -375,7 +375,7 @@ def make_table_hook(project, slots, settle_ms=_DEFAULT_SETTLE_MS, mux_proto=None
         if isinstance(scan, str):
             raise TypeError(
                 'scan=%r 需要写成 probe dict，例如 '
-                "{'kind':'ssh-scan','cmd':'/mix/addon/detect_i2c -y 8'}"
+                "{'kind':'ssh-scan','cmd':'/tmp/detect_i2c -y 8'}"
                 '（已不再支持 rpc 逐个地址扫）' % (scan,))
         return dict(scan)
 
